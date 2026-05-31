@@ -20,6 +20,7 @@ jobs:
             arch: armhf
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            rustflags: "-C target-cpu=cortex-a53"
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +34,8 @@ jobs:
         run: cargo install cross cargo-deb
 
       - name: Build with cross
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cross build --release --target ${{ matrix.target }} -p yggdrasil --features ckr
 
       - name: Package .deb
@@ -44,10 +47,23 @@ jobs:
           name: yggdrasil-ng-deb-${{ matrix.arch }}
           path: target/${{ matrix.target }}/debian/*.deb
 
-      - name: Attach to GitHub Release
+      - name: Attach .deb to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/debian/*.deb
+
+      - name: Upload raw binary (aarch64 only)
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-ng-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/yggdrasil
+
+      - name: Attach raw binary to GitHub Release (aarch64 only)
+        if: matrix.arch == 'arm64'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/yggdrasil
 
   build-mips:
     runs-on: ubuntu-latest
@@ -90,42 +106,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: yggdrasil-${{ matrix.arch }}
-
-  build-mk:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Install cross
-        run: cargo install cross
-
-      - name: Build MK binary (cortex-a53)
-        env:
-          RUSTFLAGS: "-C target-cpu=cortex-a53"
-        run: |
-          cross build --release --target aarch64-unknown-linux-musl \
-            -p yggdrasil --features ckr
-
-      - name: Rename
-        run: |
-          cp target/aarch64-unknown-linux-musl/release/yggdrasil \
-            yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: yggdrasil-ng-aarch64-mk
-          path: yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
-
-      - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
 
   build-msi:
     runs-on: windows-latest
