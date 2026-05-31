@@ -16,10 +16,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: amd64
+            artifact: amd64
           - target: armv7-unknown-linux-musleabihf
             arch: armhf
+            artifact: armhf
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            artifact: arm64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            artifact: arm64-cortex-a53
             rustflags: "-C target-cpu=cortex-a53"
 
     steps:
@@ -39,15 +45,18 @@ jobs:
         run: cross build --release --target ${{ matrix.target }} -p yggdrasil --features ckr
 
       - name: Package .deb
+        if: matrix.arch == 'arm64' && matrix.artifact == 'arm64' || matrix.arch != 'arm64'
         run: cargo deb -p yggdrasil --target ${{ matrix.target }} --no-build --features ckr
 
       - name: Upload .deb artifact
+        if: matrix.arch == 'arm64' && matrix.artifact == 'arm64' || matrix.arch != 'arm64'
         uses: actions/upload-artifact@v4
         with:
-          name: yggdrasil-ng-deb-${{ matrix.arch }}
+          name: yggdrasil-ng-deb-${{ matrix.artifact }}
           path: target/${{ matrix.target }}/debian/*.deb
 
       - name: Attach .deb to GitHub Release
+        if: matrix.arch == 'arm64' && matrix.artifact == 'arm64' || matrix.arch != 'arm64'
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/debian/*.deb
@@ -56,14 +65,18 @@ jobs:
         if: matrix.arch == 'arm64'
         uses: actions/upload-artifact@v4
         with:
-          name: yggdrasil-ng-${{ matrix.arch }}
+          name: yggdrasil-ng-${{ matrix.artifact }}
           path: target/${{ matrix.target }}/release/yggdrasil
+
+      - name: Rename raw binary for release (aarch64 only)
+        if: matrix.arch == 'arm64'
+        run: cp target/${{ matrix.target }}/release/yggdrasil yggdrasil-ng-${{ matrix.artifact }}
 
       - name: Attach raw binary to GitHub Release (aarch64 only)
         if: matrix.arch == 'arm64'
         uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/yggdrasil
+          files: yggdrasil-ng-${{ matrix.artifact }}
 
   build-mips:
     runs-on: ubuntu-latest
