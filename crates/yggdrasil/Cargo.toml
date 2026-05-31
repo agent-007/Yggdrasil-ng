@@ -63,6 +63,12 @@ optional = true
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
 
+# jemalloc doesn't cross-compile on Windows (no C toolchain),
+# MIPS (__popcountdi2 missing), or armv7 (__ffsdi2 missing).
+# On Linux/macOS x86_64/aarch64 it's enabled unconditionally.
+[target.'cfg(not(any(target_os = "windows", target_arch = "mips", target_arch = "mips64", target_arch = "arm")))'.dependencies]
+jemallocator = "0.5"
+
 [package.metadata.deb]
 name = "yggdrasil-ng"
 maintainer = "Revertron"

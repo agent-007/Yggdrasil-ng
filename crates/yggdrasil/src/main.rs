@@ -16,6 +16,13 @@ use yggdrasil::tun::TunAdapter;
 #[cfg(windows)]
 mod service;
 
+// jemalloc: per-thread arenas, enabled on x86_64/aarch64.
+// Excluded on Windows (no C toolchain), MIPS (linker errors),
+// and armv7 (__ffsdi2 missing).
+#[cfg(not(any(target_os = "windows", target_arch = "mips", target_arch = "mips64", target_arch = "arm")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
