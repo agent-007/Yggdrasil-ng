@@ -6,12 +6,12 @@
 pub(crate) mod crypto;
 pub(crate) mod session;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -21,16 +21,70 @@ use crate::types::{Addr, Error, Result};
 use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey};
 use self::session::{ConcurrentSessionManager, OutAction, SESSION_TRAFFIC_OVERHEAD};
 
-/// Channel capacity for delivering decrypted traffic to readers.
-/// Must be large enough to absorb bursts without blocking the decrypt loop,
-/// otherwise backpressure propagates to ironwood's delivery queue which drops
-/// packets older than 25 ms.
-const RECV_CHANNEL_SIZE: usize = 512;
+/// Maximum number of decrypted packets buffered for read_from.
+const BUFFER_CAPACITY: usize = 64;
 
-/// Decrypted incoming message.
-struct DecryptedMessage {
+/// A decrypted message waiting to be delivered.
+#[derive(Clone)]
+struct QueuedMessage {
     source: crate::crypto::PublicKey,
     data: Vec<u8>,
+}
+
+/// Shared buffer between the background reader and `read_from`.
+struct TrafficBuffer {
+    queue: Mutex<VecDeque<QueuedMessage>>,
+    notify: tokio::sync::Notify,
+}
+
+impl TrafficBuffer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::with_capacity(BUFFER_CAPACITY)),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Push a decrypted message. Returns true if a reader should be woken.
+    async fn push(&self, msg: QueuedMessage) {
+        let was_empty = {
+            let mut q = self.queue.lock().await;
+            let was_empty = q.is_empty();
+            if q.len() < BUFFER_CAPACITY {
+                q.push_back(msg);
+            }
+            was_empty
+        };
+        // Wake a reader only if the queue was empty (a reader might be sleeping).
+        // If non-empty, readers are already in a pop loop.
+        if was_empty {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Try to pop a message without waiting. Returns immediately.
+    async fn try_pop(&self) -> Option<QueuedMessage> {
+        let mut q = self.queue.lock().await;
+        q.pop_front()
+    }
+
+    /// Wait for a message or cancellation.
+    async fn pop_or_wait(&self, cancel: &CancellationToken) -> Option<QueuedMessage> {
+        loop {
+            // Check queue first
+            {
+                let mut q = self.queue.lock().await;
+                if let Some(msg) = q.pop_front() {
+                    return Some(msg);
+                }
+            }
+            // Wait for notification or cancellation
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                _ = self.notify.notified() => {}
+            }
+        }
+    }
 }
 
 /// Public session entry returned by `get_sessions()`.
@@ -43,24 +97,40 @@ pub struct SessionEntry {
 }
 
 /// Encrypted PacketConn: wraps a network `PacketConnImpl` with encryption.
+///
+/// A background reader task (`session_handler_loop`) continuously reads raw
+/// packets from the inner PacketConn, decrypts them, and routes session
+/// protocol messages (init/ack) inline.  Decrypted traffic packets are pushed
+/// into a low-overhead `TrafficBuffer` — a `VecDeque` behind a `tokio::sync::Mutex`
+/// with a `Notify` for wakeup.  This replaces the heavier `mpsc` channel used
+/// previously.
+///
+/// `read_from` pops from this buffer.  If the buffer is empty, `read_from`
+/// reads and decrypts directly from the inner PacketConn, avoiding the
+/// intermediate wakeup entirely on the hot path.
 pub struct EncryptedPacketConn {
     /// The underlying network-level PacketConn.
     inner: Arc<PacketConnImpl>,
     /// Our Ed25519 signing key.
     signing_key: SigningKey,
-    /// Session manager with per-session locking (shared with reader task).
+    /// Our Curve25519 private key (derived from Ed25519 seed).
+    curve_priv: CurvePrivateKey,
+    /// Session manager with per-session locking.
     sessions: Arc<ConcurrentSessionManager>,
-    /// Channel for delivering decrypted traffic to read_from.
-    recv_rx: Mutex<mpsc::Receiver<DecryptedMessage>>,
-    recv_tx: mpsc::Sender<DecryptedMessage>,
+    /// Buffered decrypted traffic from background reader.
+    buffer: Arc<TrafficBuffer>,
+    /// Serialises access to `inner.read_from()` between the background reader
+    /// and the inline read in `read_from`.  Both tasks may call inner.read_from()
+    /// concurrently, so a mutex ensures packets are not stolen mid-read.
+    inner_lock: Arc<Mutex<()>>,
     /// Whether this conn is closed.
     closed: AtomicBool,
     /// Cancellation for background tasks.
     cancel: CancellationToken,
-    /// Reader task handle (wrapped in Mutex so we can await it in close()).
-    reader_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Session cleanup task handle (wrapped in Mutex so we can await it in close()).
-    cleanup_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Background reader task handle.
+    reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Session cleanup task handle.
+    cleanup_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EncryptedPacketConn {
@@ -69,24 +139,22 @@ impl EncryptedPacketConn {
         let curve_priv = ed25519_private_to_curve25519(&secret);
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
         let sessions = Arc::new(ConcurrentSessionManager::new());
-        let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
+        let buffer = TrafficBuffer::new();
+        let inner_lock = Arc::new(Mutex::new(()));
         let cancel = CancellationToken::new();
 
-        // Spawn reader task: reads from inner, decrypts, delivers
+        // Spawn background reader for session management and traffic buffering
         let reader_handle = {
             let inner = inner.clone();
             let sessions = sessions.clone();
-            let recv_tx = recv_tx.clone();
+            let buffer = buffer.clone();
+            let inner_lock = inner_lock.clone();
             let cancel = cancel.clone();
             let signing_key = secret.clone();
             let curve_priv = curve_priv;
-            tokio::spawn(encrypted_reader_loop(
-                inner,
-                sessions,
-                recv_tx,
-                cancel,
-                signing_key,
-                curve_priv,
+            tokio::spawn(session_handler_loop(
+                inner, sessions, buffer, inner_lock, cancel,
+                signing_key, curve_priv,
             ))
         };
 
@@ -100,9 +168,10 @@ impl EncryptedPacketConn {
         Self {
             inner,
             signing_key: secret,
+            curve_priv,
             sessions,
-            recv_rx: Mutex::new(recv_rx),
-            recv_tx,
+            buffer,
+            inner_lock,
             closed: AtomicBool::new(false),
             cancel,
             reader_handle: Mutex::new(Some(reader_handle)),
@@ -181,7 +250,6 @@ impl EncryptedPacketConn {
     }
 }
 
-/// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
 /// Background task that periodically cleans up expired sessions and buffers.
 /// Runs every 30 seconds to remove sessions/buffers older than SESSION_TIMEOUT (60s).
 async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: CancellationToken) {
@@ -200,23 +268,28 @@ async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: C
     }
 }
 
-async fn encrypted_reader_loop(
+/// Background reader: reads raw packets from inner, decrypts, and either
+/// handles session protocol inline or buffers traffic for `read_from`.
+async fn session_handler_loop(
     inner: Arc<PacketConnImpl>,
     sessions: Arc<ConcurrentSessionManager>,
-    recv_tx: mpsc::Sender<DecryptedMessage>,
+    buffer: Arc<TrafficBuffer>,
+    inner_lock: Arc<Mutex<()>>,
     cancel: CancellationToken,
     signing_key: SigningKey,
     curve_priv: CurvePrivateKey,
 ) {
     use crate::types::PacketConn;
 
-    let mut buf = vec![0u8; 128 * 1024]; // 128 KB buffer
+    let mut buf = vec![0u8; 128 * 1024];
 
     loop {
-        tracing::debug!("encrypted_reader_loop");
-        let read_result = tokio::select! {
-            _ = cancel.cancelled() => break,
-            result = inner.read_from(&mut buf) => result,
+        let read_result = {
+            let _guard = inner_lock.lock().await;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = inner.read_from(&mut buf) => result,
+            }
         };
 
         let (n, from_addr) = match read_result {
@@ -226,22 +299,18 @@ async fn encrypted_reader_loop(
 
         let from_key = from_addr.0;
 
-        // Decrypt via session manager (per-session locking, no global mutex)
-        let actions = sessions.handle_data(&from_key, &buf[..n], &curve_priv, &signing_key);
+        let actions = sessions.handle_data(
+            &from_key, &buf[..n],
+            &curve_priv, &signing_key,
+        );
 
-        // Process actions (all locks already released)
         for action in actions {
             match action {
                 OutAction::SendToInner { dest, data } => {
-                    tracing::debug!("encrypted_reader: sending {} bytes to inner (session msg)", data.len());
                     let _ = inner.write_to(&data, &Addr(dest)).await;
                 }
                 OutAction::Deliver { source, data } => {
-                    tracing::debug!("encrypted_reader: delivering {} bytes from {:?}", data.len(), hex::encode(&source[..4]));
-                    let msg = DecryptedMessage { source, data };
-                    if recv_tx.send(msg).await.is_err() {
-                        return; // channel closed
-                    }
+                    buffer.push(QueuedMessage { source, data }).await;
                 }
             }
         }
@@ -250,25 +319,61 @@ async fn encrypted_reader_loop(
 
 #[async_trait::async_trait]
 impl crate::types::PacketConn for EncryptedPacketConn {
+    /// Read and decrypt a packet from the network.
+    ///
+    /// Hot path: first tries the traffic buffer (pushed by the background
+    /// session handler).  If empty, reads directly from inner and decrypts
+    /// inline — this eliminates the task wakeup when the calling task is
+    /// the one waiting on `inner.read_from()`.
     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
+        use crate::types::PacketConn;
+
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
 
-        let mut rx = self.recv_rx.lock().await;
+        // Fast path: check buffer first (cheap, no wakeup needed)
+        if let Some(msg) = self.buffer.try_pop().await {
+            let n = buf.len().min(msg.data.len());
+            buf[..n].copy_from_slice(&msg.data[..n]);
+            return Ok((n, Addr(msg.source)));
+        }
+
+        // Slow path: nothing buffered — read from inner directly.
+        // This avoids the context switch between background reader and us.
         let cancel = self.cancel.clone();
+        let mut inner_buf = vec![0u8; 128 * 1024];
 
-        let msg = tokio::select! {
-            _ = cancel.cancelled() => return Err(Error::Closed),
-            msg = rx.recv() => match msg {
-                Some(m) => m,
-                None => return Err(Error::Closed),
-            },
-        };
+        loop {
+            let read_result = {
+                let _guard = self.inner_lock.lock().await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(Error::Closed),
+                    result = self.inner.read_from(&mut inner_buf) => result,
+                }
+            };
 
-        let n = buf.len().min(msg.data.len());
-        buf[..n].copy_from_slice(&msg.data[..n]);
-        Ok((n, Addr(msg.source)))
+            let (n, from_addr) = read_result?;
+            let from_key = from_addr.0;
+
+            let actions = self.sessions.handle_data(
+                &from_key, &inner_buf[..n],
+                &self.curve_priv, &self.signing_key,
+            );
+
+            for action in actions {
+                match action {
+                    OutAction::SendToInner { dest, data } => {
+                        let _ = self.inner.write_to(&data, &Addr(dest)).await;
+                    }
+                    OutAction::Deliver { source, data } => {
+                        let n = buf.len().min(data.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        return Ok((n, Addr(source)));
+                    }
+                }
+            }
+        }
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
@@ -290,9 +395,8 @@ impl crate::types::PacketConn for EncryptedPacketConn {
                 OutAction::SendToInner { dest, data } => {
                     self.inner.write_to(&data, &Addr(dest)).await?;
                 }
-                OutAction::Deliver { source, data } => {
-                    let msg = DecryptedMessage { source, data };
-                    let _ = self.recv_tx.send(msg).await;
+                OutAction::Deliver { .. } => {
+                    // write_to never produces Deliver — only handle_data does
                 }
             }
         }
