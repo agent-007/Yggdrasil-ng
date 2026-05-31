@@ -90,6 +90,42 @@ jobs:
         with:
           files: yggdrasil-${{ matrix.arch }}
 
+  build-mk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build MK binary (cortex-a53)
+        env:
+          RUSTFLAGS: "-C target-cpu=cortex-a53"
+        run: |
+          cross build --release --target aarch64-unknown-linux-musl \
+            -p yggdrasil --features ckr
+
+      - name: Rename
+        run: |
+          cp target/aarch64-unknown-linux-musl/release/yggdrasil \
+            yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-ng-aarch64-mk
+          path: yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: yggdrasil-ng-${{ github.ref_name }}-aarch64-mk
+
   build-msi:
     runs-on: windows-latest
     strategy:

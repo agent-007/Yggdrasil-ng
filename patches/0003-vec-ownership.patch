@@ -1,0 +1,279 @@
+From 6bf87e630d4877704936921d819436871cb52de0 Mon Sep 17 00:00:00 2001
+From: Alex Gorbachenko <alex.gorbachenko@gmail.com>
+Date: Sun, 31 May 2026 08:34:20 +0300
+Subject: [PATCH] Pass Vec<u8> by ownership through write_to chain
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Changes the PacketConn::write_to signature from &[u8] to Vec<u8>,
+eliminating a redundant buf.to_vec() allocation+memcpy per outbound
+packet.
+
+Background:
+  The encrypted layer holds data in an owned Vec<u8> (from session
+  encryption).  Passing it by reference through write_to forced an
+  extra clone inside PacketConnImpl (buf.to_vec()).  With 3500 pps
+  at 40 Mbps, this is ~3500 × 1.5 KB = 5 MB/s of unnecessary
+  allocations and copies.
+
+Fix:
+  Changed the trait signature and all 3 implementations
+  (PacketConnImpl, EncryptedPacketConn, SignedPacketConn) from
+  write_to(&self, buf: &[u8], addr) to write_to(&self, buf: Vec<u8>,
+  addr).  The owned Vec moves directly into TrafficPacket::new
+  without copying.
+
+  All callers already hold owned Vec<u8> data — the change is
+  mechanical.
+
+Breaking change:
+  Pub trait PacketConn.  Only 3 implementations exist, all within
+  the ironwood crate.  No external implementors.
+
+At 40 Mbps on hAP ax³ (+jemalloc +cs-v1 +cortex-a53 +cpu3):
+  Before: ~27% CPU
+  After:   24% CPU  (-3 p.p.)
+
+The optimisation is architecture-independent — saves one heap
+allocation and one memcpy per outbound packet on any platform.
+---
+ crates/ironwood/src/core.rs          | 11 ++++++-----
+ crates/ironwood/src/encrypted/mod.rs | 15 ++++++++-------
+ crates/ironwood/src/signed.rs        | 11 ++++++-----
+ crates/ironwood/src/types.rs         |  5 +++--
+ crates/ironwood/tests/integration.rs | 12 ++++++------
+ crates/yggdrasil/src/core.rs         |  4 ++--
+ 6 files changed, 31 insertions(+), 27 deletions(-)
+
+diff --git a/crates/ironwood/src/core.rs b/crates/ironwood/src/core.rs
+index 4a7159c..e2170c3 100644
+--- a/crates/ironwood/src/core.rs
++++ b/crates/ironwood/src/core.rs
+@@ -619,20 +619,21 @@ impl crate::types::PacketConn for PacketConnImpl {
+         Ok((n, addr))
+     }
+ 
+-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
++    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
+         if self.closed.load(Ordering::Relaxed) {
+             return Err(Error::Closed);
+         }
+ 
+         let mtu = self.mtu();
+-        if buf.len() as u64 > mtu {
++        let len = buf.len();
++        if len as u64 > mtu {
+             return Err(Error::OversizedMessage);
+         }
+ 
+-        let traffic = TrafficPacket::new(self.pub_key, addr.0, buf.to_vec());
++        let traffic = TrafficPacket::new(self.pub_key, addr.0, buf);
+         self.router_handle.send(RouterMsg::SendTraffic { traffic });
+ 
+-        Ok(buf.len())
++        Ok(len)
+     }
+ 
+     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
+@@ -980,7 +981,7 @@ mod tests {
+ 
+         use crate::types::PacketConn;
+         let addr = conn.local_addr();
+-        let result = conn.write_to(b"hello", &addr).await;
++        let result = conn.write_to(b"hello".to_vec(), &addr).await;
+         assert!(result.is_ok());
+         assert_eq!(result.unwrap(), 5);
+ 
+diff --git a/crates/ironwood/src/encrypted/mod.rs b/crates/ironwood/src/encrypted/mod.rs
+index e9f3f59..5617410 100644
+--- a/crates/ironwood/src/encrypted/mod.rs
++++ b/crates/ironwood/src/encrypted/mod.rs
+@@ -307,7 +307,7 @@ async fn session_handler_loop(
+         for action in actions {
+             match action {
+                 OutAction::SendToInner { dest, data } => {
+-                    let _ = inner.write_to(&data, &Addr(dest)).await;
++                    let _ = inner.write_to(data, &Addr(dest)).await;
+                 }
+                 OutAction::Deliver { source, data } => {
+                     buffer.push(QueuedMessage { source, data }).await;
+@@ -364,7 +364,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
+             for action in actions {
+                 match action {
+                     OutAction::SendToInner { dest, data } => {
+-                        let _ = self.inner.write_to(&data, &Addr(dest)).await;
++                        let _ = self.inner.write_to(data, &Addr(dest)).await;
+                     }
+                     OutAction::Deliver { source, data } => {
+                         let n = buf.len().min(data.len());
+@@ -376,24 +376,25 @@ impl crate::types::PacketConn for EncryptedPacketConn {
+         }
+     }
+ 
+-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
++    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
+         if self.closed.load(Ordering::Relaxed) {
+             return Err(Error::Closed);
+         }
+ 
++        let len = buf.len();
+         let mtu = self.mtu();
+-        if buf.len() as u64 > mtu {
++        if len as u64 > mtu {
+             return Err(Error::OversizedMessage);
+         }
+ 
+         let dest = addr.0;
+ 
+-        let actions = self.sessions.write_to(&dest, buf, &self.signing_key);
++        let actions = self.sessions.write_to(&dest, &buf, &self.signing_key);
+ 
+         for action in actions {
+             match action {
+                 OutAction::SendToInner { dest, data } => {
+-                    self.inner.write_to(&data, &Addr(dest)).await?;
++                    self.inner.write_to(data, &Addr(dest)).await?;
+                 }
+                 OutAction::Deliver { .. } => {
+                     // write_to never produces Deliver — only handle_data does
+@@ -401,7 +402,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
+             }
+         }
+ 
+-        Ok(buf.len())
++        Ok(len)
+     }
+ 
+     async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
+diff --git a/crates/ironwood/src/signed.rs b/crates/ironwood/src/signed.rs
+index 1190e01..ca5e671 100644
+--- a/crates/ironwood/src/signed.rs
++++ b/crates/ironwood/src/signed.rs
+@@ -171,22 +171,23 @@ impl crate::types::PacketConn for SignedPacketConn {
+         Ok((n, Addr(msg.source)))
+     }
+ 
+-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
++    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
+         if self.closed.load(Ordering::Relaxed) {
+             return Err(Error::Closed);
+         }
+ 
++        let len = buf.len();
+         let mtu = self.mtu();
+-        if buf.len() as u64 > mtu {
++        if len as u64 > mtu {
+             return Err(Error::OversizedMessage);
+         }
+ 
+         let dest = addr.0;
+-        let signed_msg = self.sign(&dest, buf);
++        let signed_msg = self.sign(&dest, &buf);
+ 
+-        let _ = self.inner.write_to(&signed_msg, addr).await?;
++        let _ = self.inner.write_to(signed_msg, addr).await?;
+ 
+-        Ok(buf.len())
++        Ok(len)
+     }
+ 
+     async fn handle_conn(
+diff --git a/crates/ironwood/src/types.rs b/crates/ironwood/src/types.rs
+index 4fd05b0..0035746 100644
+--- a/crates/ironwood/src/types.rs
++++ b/crates/ironwood/src/types.rs
+@@ -84,8 +84,9 @@ pub trait PacketConn: Send + Sync {
+     /// Receive a packet. Returns (bytes_read, source_address).
+     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)>;
+ 
+-    /// Send a packet to the given address.
+-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
++    /// Send a packet to the given address. Takes ownership of the buffer
++    /// to avoid an extra allocation+copy inside the PacketConn layer.
++    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize>;
+ 
+     /// Accept a peer connection with the given public key and priority.
+     async fn handle_conn(
+diff --git a/crates/ironwood/tests/integration.rs b/crates/ironwood/tests/integration.rs
+index 6269ca4..2cf7501 100644
+--- a/crates/ironwood/tests/integration.rs
++++ b/crates/ironwood/tests/integration.rs
+@@ -75,7 +75,7 @@ async fn two_node_plain() {
+     let node_a2 = node_a.clone();
+     let sender = tokio::spawn(async move {
+         loop {
+-            let _ = node_a2.write_to(&msg, &addr_b).await;
++            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+@@ -140,14 +140,14 @@ async fn two_node_bidirectional() {
+     let msg2 = msg.clone();
+     let sender_a = tokio::spawn(async move {
+         loop {
+-            let _ = node_a3.write_to(&msg2, &addr_b).await;
++            let _ = node_a3.write_to(msg2.clone(), &addr_b).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+     let node_b3 = node_b.clone();
+     let sender_b = tokio::spawn(async move {
+         loop {
+-            let _ = node_b3.write_to(&msg, &addr_a).await;
++            let _ = node_b3.write_to(msg.clone(), &addr_a).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+@@ -201,7 +201,7 @@ async fn three_node_chain() {
+     let node_a2 = node_a.clone();
+     let sender = tokio::spawn(async move {
+         loop {
+-            let _ = node_a2.write_to(&msg, &addr_c).await;
++            let _ = node_a2.write_to(msg.clone(), &addr_c).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+@@ -250,7 +250,7 @@ async fn two_node_encrypted() {
+     let node_a2 = node_a.clone();
+     let sender = tokio::spawn(async move {
+         loop {
+-            let _ = node_a2.write_to(&msg, &addr_b).await;
++            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+@@ -302,7 +302,7 @@ async fn two_node_signed() {
+     let node_a2 = node_a.clone();
+     let sender = tokio::spawn(async move {
+         loop {
+-            let _ = node_a2.write_to(&msg, &addr_b).await;
++            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
+             tokio::time::sleep(Duration::from_secs(1)).await;
+         }
+     });
+diff --git a/crates/yggdrasil/src/core.rs b/crates/yggdrasil/src/core.rs
+index 1c12fa1..e6ea07a 100644
+--- a/crates/yggdrasil/src/core.rs
++++ b/crates/yggdrasil/src/core.rs
+@@ -114,7 +114,7 @@ impl Core {
+                 let mut full_msg = Vec::with_capacity(1 + msg.len());
+                 full_msg.push(TYPE_SESSION_PROTO);
+                 full_msg.extend_from_slice(&msg);
+-                let _ = inner_clone.write_to(&full_msg, &addr).await;
++                let _ = inner_clone.write_to(full_msg, &addr).await;
+             }
+         });
+ 
+@@ -210,7 +210,7 @@ impl Core {
+         let mut payload = Vec::with_capacity(1 + buf.len());
+         payload.push(TYPE_SESSION_TRAFFIC);
+         payload.extend_from_slice(buf);
+-        let n = self.inner.write_to(&payload, addr).await?;
++        let n = self.inner.write_to(payload, addr).await?;
+         if n > 0 {
+             Ok(n - 1)
+         } else {
+-- 
+2.43.0
+
