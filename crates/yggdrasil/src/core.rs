@@ -114,7 +114,7 @@ impl Core {
                 let mut full_msg = Vec::with_capacity(1 + msg.len());
                 full_msg.push(TYPE_SESSION_PROTO);
                 full_msg.extend_from_slice(&msg);
-                let _ = inner_clone.write_to(&full_msg, &addr).await;
+                let _ = inner_clone.write_to(full_msg, &addr).await;
             }
         });
 
@@ -210,7 +210,7 @@ impl Core {
         let mut payload = Vec::with_capacity(1 + buf.len());
         payload.push(TYPE_SESSION_TRAFFIC);
         payload.extend_from_slice(buf);
-        let n = self.inner.write_to(&payload, addr).await?;
+        let n = self.inner.write_to(payload, addr).await?;
         if n > 0 {
             Ok(n - 1)
         } else {

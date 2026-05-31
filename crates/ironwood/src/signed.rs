@@ -171,22 +171,23 @@ impl crate::types::PacketConn for SignedPacketConn {
         Ok((n, Addr(msg.source)))
     }
 
-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
 
+        let len = buf.len();
         let mtu = self.mtu();
-        if buf.len() as u64 > mtu {
+        if len as u64 > mtu {
             return Err(Error::OversizedMessage);
         }
 
         let dest = addr.0;
-        let signed_msg = self.sign(&dest, buf);
+        let signed_msg = self.sign(&dest, &buf);
 
-        let _ = self.inner.write_to(&signed_msg, addr).await?;
+        let _ = self.inner.write_to(signed_msg, addr).await?;
 
-        Ok(buf.len())
+        Ok(len)
     }
 
     async fn handle_conn(

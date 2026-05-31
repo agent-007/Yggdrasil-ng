@@ -619,20 +619,21 @@ impl crate::types::PacketConn for PacketConnImpl {
         Ok((n, addr))
     }
 
-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
 
         let mtu = self.mtu();
-        if buf.len() as u64 > mtu {
+        let len = buf.len();
+        if len as u64 > mtu {
             return Err(Error::OversizedMessage);
         }
 
-        let traffic = TrafficPacket::new(self.pub_key, addr.0, buf.to_vec());
+        let traffic = TrafficPacket::new(self.pub_key, addr.0, buf);
         self.router_handle.send(RouterMsg::SendTraffic { traffic });
 
-        Ok(buf.len())
+        Ok(len)
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
@@ -980,7 +981,7 @@ mod tests {
 
         use crate::types::PacketConn;
         let addr = conn.local_addr();
-        let result = conn.write_to(b"hello", &addr).await;
+        let result = conn.write_to(b"hello".to_vec(), &addr).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 5);
 

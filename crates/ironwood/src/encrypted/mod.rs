@@ -307,7 +307,7 @@ async fn session_handler_loop(
         for action in actions {
             match action {
                 OutAction::SendToInner { dest, data } => {
-                    let _ = inner.write_to(&data, &Addr(dest)).await;
+                    let _ = inner.write_to(data, &Addr(dest)).await;
                 }
                 OutAction::Deliver { source, data } => {
                     buffer.push(QueuedMessage { source, data }).await;
@@ -364,7 +364,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
             for action in actions {
                 match action {
                     OutAction::SendToInner { dest, data } => {
-                        let _ = self.inner.write_to(&data, &Addr(dest)).await;
+                        let _ = self.inner.write_to(data, &Addr(dest)).await;
                     }
                     OutAction::Deliver { source, data } => {
                         let n = buf.len().min(data.len());
@@ -376,24 +376,25 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         }
     }
 
-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
 
+        let len = buf.len();
         let mtu = self.mtu();
-        if buf.len() as u64 > mtu {
+        if len as u64 > mtu {
             return Err(Error::OversizedMessage);
         }
 
         let dest = addr.0;
 
-        let actions = self.sessions.write_to(&dest, buf, &self.signing_key);
+        let actions = self.sessions.write_to(&dest, &buf, &self.signing_key);
 
         for action in actions {
             match action {
                 OutAction::SendToInner { dest, data } => {
-                    self.inner.write_to(&data, &Addr(dest)).await?;
+                    self.inner.write_to(data, &Addr(dest)).await?;
                 }
                 OutAction::Deliver { .. } => {
                     // write_to never produces Deliver — only handle_data does
@@ -401,7 +402,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
             }
         }
 
-        Ok(buf.len())
+        Ok(len)
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {

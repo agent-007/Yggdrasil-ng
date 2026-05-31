@@ -75,7 +75,7 @@ async fn two_node_plain() {
     let node_a2 = node_a.clone();
     let sender = tokio::spawn(async move {
         loop {
-            let _ = node_a2.write_to(&msg, &addr_b).await;
+            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -140,14 +140,14 @@ async fn two_node_bidirectional() {
     let msg2 = msg.clone();
     let sender_a = tokio::spawn(async move {
         loop {
-            let _ = node_a3.write_to(&msg2, &addr_b).await;
+            let _ = node_a3.write_to(msg2.clone(), &addr_b).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
     let node_b3 = node_b.clone();
     let sender_b = tokio::spawn(async move {
         loop {
-            let _ = node_b3.write_to(&msg, &addr_a).await;
+            let _ = node_b3.write_to(msg.clone(), &addr_a).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -201,7 +201,7 @@ async fn three_node_chain() {
     let node_a2 = node_a.clone();
     let sender = tokio::spawn(async move {
         loop {
-            let _ = node_a2.write_to(&msg, &addr_c).await;
+            let _ = node_a2.write_to(msg.clone(), &addr_c).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -250,7 +250,7 @@ async fn two_node_encrypted() {
     let node_a2 = node_a.clone();
     let sender = tokio::spawn(async move {
         loop {
-            let _ = node_a2.write_to(&msg, &addr_b).await;
+            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -302,7 +302,7 @@ async fn two_node_signed() {
     let node_a2 = node_a.clone();
     let sender = tokio::spawn(async move {
         loop {
-            let _ = node_a2.write_to(&msg, &addr_b).await;
+            let _ = node_a2.write_to(msg.clone(), &addr_b).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });

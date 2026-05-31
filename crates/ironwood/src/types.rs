@@ -84,8 +84,9 @@ pub trait PacketConn: Send + Sync {
     /// Receive a packet. Returns (bytes_read, source_address).
     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)>;
 
-    /// Send a packet to the given address.
-    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
+    /// Send a packet to the given address. Takes ownership of the buffer
+    /// to avoid an extra allocation+copy inside the PacketConn layer.
+    async fn write_to(&self, buf: Vec<u8>, addr: &Addr) -> Result<usize>;
 
     /// Accept a peer connection with the given public key and priority.
     async fn handle_conn(
