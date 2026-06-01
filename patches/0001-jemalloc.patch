@@ -1,4 +1,4 @@
-From d498135637241c11e027ee0f9376a1976d2795c6 Mon Sep 17 00:00:00 2001
+From edb08e1565e3f7f6889751bd2a8c581715cd81de Mon Sep 17 00:00:00 2001
 From: Alex Gorbachenko <alex.gorbachenko@gmail.com>
 Date: Sun, 31 May 2026 08:33:02 +0300
 Subject: [PATCH] Use jemalloc instead of system allocator
@@ -8,26 +8,23 @@ Content-Transfer-Encoding: 8bit
 
 Replaces the default system allocator with jemalloc via the
 jemallocator crate.  Jemalloc uses per-thread arenas, eliminating
-allocator lock contention when multiple threads allocate under load
-(crypto, routing, TUN r/w, admin API).
+allocator lock contention when multiple threads allocate under load.
 
 On musl targets (Alpine Linux, RouterOS containers, embedded systems),
-the musl malloc uses a global lock that becomes the bottleneck under
-multi-threaded workloads.  At 40 Mbps on a hAP ax³ (Cortex-A53):
+the musl malloc global lock becomes the bottleneck.  At 40 Mbps on a
+hAP ax³ (Cortex-A53): 67% CPU → 47% CPU (-20 p.p.).
 
-  Before (musl malloc): 67% CPU, 9 retransmits
-  After  (jemalloc):    47% CPU, 1 retransmit  (-20 p.p.)
-
-Glibc targets benefit less (glibc malloc is more optimised) but still
-see measurable improvement from per-thread arenas.
+Jemalloc is excluded from Windows (no C cross-compiler), MIPS/mips64
+(__popcountdi2 missing), and armv7/armhf (__ffsdi2 missing).
+Controlled via target-gated deps in Cargo.toml and #[cfg] in main.rs.
 ---
- Cargo.lock                   | 413 ++++++++++++++++++-----------------
- crates/yggdrasil/Cargo.toml  |   1 +
- crates/yggdrasil/src/main.rs |   3 +
- 3 files changed, 221 insertions(+), 196 deletions(-)
+ Cargo.lock                   | 415 ++++++++++++++++++-----------------
+ crates/yggdrasil/Cargo.toml  |   6 +
+ crates/yggdrasil/src/main.rs |   7 +
+ 3 files changed, 231 insertions(+), 197 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 4e3c651..9d09460 100644
+index 4e3c651..3371193 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -108,9 +108,9 @@ dependencies = [
@@ -1052,7 +1049,7 @@ index 4e3c651..9d09460 100644
   "data-encoding",
   "der-parser 10.0.0",
   "lazy_static",
-@@ -3053,10 +3072,11 @@ dependencies = [
+@@ -3053,16 +3072,17 @@ dependencies = [
  
  [[package]]
  name = "yasna"
@@ -1066,6 +1063,13 @@ index 4e3c651..9d09460 100644
   "time",
  ]
  
+ [[package]]
+ name = "yggdrasil"
+-version = "0.1.6"
++version = "0.2.0"
+ dependencies = [
+  "arc-swap",
+  "blake2",
 @@ -3073,6 +3093,7 @@ dependencies = [
   "hex",
   "ipnet",
@@ -1128,25 +1132,34 @@ index 4e3c651..9d09460 100644
   "zerofrom-derive",
  ]
 diff --git a/crates/yggdrasil/Cargo.toml b/crates/yggdrasil/Cargo.toml
-index 4f55279..02cce63 100644
+index 4f55279..71c9e64 100644
 --- a/crates/yggdrasil/Cargo.toml
 +++ b/crates/yggdrasil/Cargo.toml
-@@ -40,6 +40,7 @@ socket2 = "0.6.3"
- getifaddrs = "0.6"
- rustc-hash = "2.1.2"
- arc-swap = "1.9"
-+jemallocator = "0.5"
+@@ -63,6 +63,12 @@ optional = true
+ [target.'cfg(windows)'.dependencies]
+ windows-service = "0.8.0"
  
- [features]
- default = ["ctl", "tun"]
++# jemalloc doesn't cross-compile on Windows (no C toolchain),
++# MIPS (__popcountdi2 missing), or armv7 (__ffsdi2 missing).
++# On Linux/macOS x86_64/aarch64 it's enabled unconditionally.
++[target.'cfg(not(any(target_os = "windows", target_arch = "mips", target_arch = "mips64", target_arch = "arm")))'.dependencies]
++jemallocator = "0.5"
++
+ [package.metadata.deb]
+ name = "yggdrasil-ng"
+ maintainer = "Revertron"
 diff --git a/crates/yggdrasil/src/main.rs b/crates/yggdrasil/src/main.rs
-index c95d11f..b1d4963 100644
+index c95d11f..9a6b89b 100644
 --- a/crates/yggdrasil/src/main.rs
 +++ b/crates/yggdrasil/src/main.rs
-@@ -16,6 +16,9 @@ use yggdrasil::tun::TunAdapter;
+@@ -16,6 +16,13 @@ use yggdrasil::tun::TunAdapter;
  #[cfg(windows)]
  mod service;
  
++// jemalloc: per-thread arenas, enabled on x86_64/aarch64.
++// Excluded on Windows (no C toolchain), MIPS (linker errors),
++// and armv7 (__ffsdi2 missing).
++#[cfg(not(any(target_os = "windows", target_arch = "mips", target_arch = "mips64", target_arch = "arm")))]
 +#[global_allocator]
 +static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 +

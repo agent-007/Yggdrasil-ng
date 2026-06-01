@@ -1,4 +1,4 @@
-From 9b9a15cd4fc1f293786ca120c4c79f616b001b99 Mon Sep 17 00:00:00 2001
+From cb80dcee491e3077292659a4ce4fff6c3af215a4 Mon Sep 17 00:00:00 2001
 From: Alex Gorbachenko <alex.gorbachenko@gmail.com>
 Date: Sun, 31 May 2026 08:33:37 +0300
 Subject: [PATCH] Replace mpsc channel with TrafficBuffer in encrypted reader

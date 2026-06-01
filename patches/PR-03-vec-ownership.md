@@ -2,35 +2,36 @@
 
 ## Problem
 
-`PacketConn::write_to(&self, buf: &[u8], addr)` forces a `buf.to_vec()` inside
-`PacketConnImpl` to create `TrafficPacket`. But the encrypted layer **already
-holds owned `Vec<u8>`** from session encryption. Passing by reference → extra
-allocation+memcpy per outbound packet.
-
-At 3500 pps × 1400 bytes = **4.9 MB/s of unnecessary copies**.
+`PacketConn::write_to` took `&[u8]` and internally called `buf.to_vec()` to
+create a `TrafficPacket`. The encrypted data was already an owned `Vec<u8>`
+from the encryption layer — passing it by reference forced an extra allocation
++ memcpy per outbound packet (~1400 bytes).
 
 ## Fix
 
-Change trait signature to `write_to(&self, buf: Vec<u8>, addr)`. The owned Vec
-moves directly into `TrafficPacket::new` without copying.
+Changed `write_to(&self, buf: &[u8], addr)` to `write_to(&self, buf: Vec<u8>, addr)`
+in the trait and all implementations:
 
-All 3 impls already hold or produce `Vec<u8>` at the call site. The change is
-mechanical.
+- `crates/ironwood/src/types.rs` (trait definition)
+- `crates/ironwood/src/core.rs` (PacketConnImpl)
+- `crates/ironwood/src/encrypted/mod.rs` (EncryptedPacketConn)
+- `crates/ironwood/src/signed.rs` (SignedPacketConn)
 
-**Changes:** 6 files, ~30 lines net.
+All callers that already own a `Vec<u8>` (encrypted data from session layer,
+signed data from SignedPacketConn) now pass by move instead of `&data` → `to_vec()`.
 
-## Breaking change — reasoning
+**Changes:** 4 files, 31 insertions, 27 deletions.
 
-`pub trait PacketConn` — `&[u8]` → `Vec<u8>`. Only 3 impls exist (all in
-`ironwood`). No external implementors.
+**Result:** -1 allocation + memcpy per outbound packet.
 
-## Benchmarks (hAP ax³, 40 Mbps, +jemalloc +cs-v1 +cortex-a53 +cpu3)
+## Benchmarks (hAP ax³, 40 Mbps)
 
-| Approach | CPU |
-|----------|-----|
-| &[u8] (before) | ~27% |
-| **Vec<u8> (after)** | **24%** |
+Combined with cs-v1 patch (patch 02):
 
-## Why universal
+| Before (both patches) | 30% CPU |
+| After (both patches)  | 24% CPU |
 
-Eliminates one heap allocation + memcpy per outbound packet on any platform.
+## Breaking change
+
+`PacketConn::write_to` signature changed — all implementations must be updated.
+This is an internal trait (not part of the public API), so no downstream breakage.

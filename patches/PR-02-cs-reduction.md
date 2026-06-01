@@ -1,45 +1,40 @@
-# PR: Replace mpsc channel with TrafficBuffer in encrypted reader
+# PR: Reduce context switches in inbound packet path
 
 ## Problem
 
-The inbound packet path contains three cross-task hops:
+The inbound packet path had 3 context switches (mpsc channel hops) per packet:
 
 ```
-peer_reader → router → encrypted_reader_loop → tun_write_loop
-             ①         ②                         ③
+peer_reader → router → encrypted_reader_loop → recv_tx → Core::read_from → rwc.read → tun_write_loop
 ```
 
-Each hop is a context switch (tokio task wakeup). On a single-core pinned
-deployment, each CS costs 5-10µs. At 3500 pps (40 Mbps), that's ~10,500 CS/sec
-just for inbound.
+The `encrypted_reader_loop` decrypted packets and sent them via `mpsc` channel
+to `tun_write_loop`. This added one context switch per inbound packet.
 
-The third hop (③ `encrypted_reader_loop → tun_write_loop` via mpsc) is the
-easiest to eliminate: decrypt and TUN-write can happen in the **same task**.
+At 40 Mbps (~3500 pps), this is 3500 unnecessary CS/second.
 
 ## Fix
 
 Replace `mpsc` channel with `TrafficBuffer` (VecDeque + tokio::sync::Mutex + Notify).
 
-`read_from()` has two paths:
-1. **Fast path** — pop from buffer. Zero extra CS.
-2. **Slow path** — `inner.read_from()` + decrypt inline. Same task, no CS.
+`read_from` first checks the buffer (fast path — pop). If empty, reads and
+decrypts inline from `inner.read_from()` — zero extra CS on the hot path when
+the TUN writer is the one waiting.
 
-Background `session_handler_loop` handles session handshake (init/ack) only.
-`inner_lock: Arc<Mutex<()>>` serialises `inner.read_from()` between background
-and inline reader.
+A background `session_handler_loop` still reads from inner to process session
+handshake messages (init/ack), ensuring write_to-only nodes complete the
+handshake. `inner_lock` (Arc<Mutex<()>>) serialises access between the
+background reader and the inline `read_from`.
 
-**Changes:** 1 file, ~100 lines.
+**Changes:** 1 file (crates/ironwood/src/encrypted/mod.rs).
 
-## Benchmarks (hAP ax³, 40 Mbps, +jemalloc +cortex-a53 +cpu3)
+**Result:** -1 context switch per inbound packet.
 
-| Approach | CPU | CS/inbound |
-|----------|-----|------------|
-| mpsc channel | 30% | 3 |
-| **TrafficBuffer** | -1 CS | combined with pool → 24% total |
+## Benchmarks (hAP ax³, 40 Mbps)
 
-## Why universal
+Combined with Vec ownership patch (patch 03):
 
-Any async runtime pays for cross-task wakeups. On x86 the percentage is smaller
-but the absolute overhead is identical.
+| Before (both patches) | 30% CPU |
+| After (both patches)  | 24% CPU |
 
 ## No breaking changes

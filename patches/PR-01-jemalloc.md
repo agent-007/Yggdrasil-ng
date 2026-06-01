@@ -4,13 +4,7 @@
 
 On musl-based targets (Alpine Linux, RouterOS containers, embedded systems),
 `musl malloc` uses a **global lock** for all memory allocations. Under multi-threaded
-workloads, this lock becomes the dominant bottleneck:
-
-```
-Thread A (crypto):  malloc(512)  ──┐
-Thread B (routing): malloc(1024) ──┤── wait for global lock
-Thread C (TUN r/w): free(ptr)    ──┘
-```
+workloads, this lock becomes the dominant bottleneck.
 
 yggdrasil-ng has 4-5 active threads under load: crypto (ed25519 sign/verify),
 routing (tree maintenance, bloom filters), TUN reader+writer, admin API handler.
@@ -21,15 +15,22 @@ with 9 retransmits.
 ## Fix
 
 Replace with **jemalloc** (via `jemallocator` crate). Per-thread arenas eliminate
-lock contention:
+lock contention.
 
-```
-Thread A: malloc(512)  ── arena 1 ── no wait
-Thread B: malloc(1024) ── arena 2 ── no wait
-Thread C: free(ptr)    ── arena 3 ── no wait
-```
+**Changes:** 2 files (Cargo.toml + main.rs), ~5 lines, plus Cargo.lock update.
 
-**Changes:** 2 files, 3 lines.
+Jemalloc is enabled via target-gated dependencies — only on platforms where
+`jemalloc-sys` (native C build) can compile.
+
+## Platforms where jemalloc is excluded
+
+| Platform | Reason |
+|----------|--------|
+| Windows | No C cross-compiler on GitHub Actions runner |
+| MIPS / mips64 | `__popcountdi2` undefined |
+| armv7 / armhf | `__ffsdi2` undefined |
+
+On x86_64 and aarch64 Linux/macOS, jemalloc is enabled unconditionally.
 
 ## Benchmarks (hAP ax³, 40 Mbps)
 
@@ -40,8 +41,9 @@ Thread C: free(ptr)    ── arena 3 ── no wait
 
 ## Why universal
 
-- **musl targets:** Immediate benefit — musl malloc is the bottleneck on all musl distributions
+- **musl targets:** Immediate benefit — musl malloc is the bottleneck
 - **glibc targets:** Smaller but measurable improvement from per-thread arenas
 - **No API changes:** `#[global_allocator]` replaces the allocator globally
+- **No breakage on unsupported platforms:** cfg-gated
 
 ## No breaking changes

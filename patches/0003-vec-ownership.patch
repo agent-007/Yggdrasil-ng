@@ -1,7 +1,7 @@
-From 6bf87e630d4877704936921d819436871cb52de0 Mon Sep 17 00:00:00 2001
+From 1825a1f4a4fec7763136653fe756bedc71bb0a1c Mon Sep 17 00:00:00 2001
 From: Alex Gorbachenko <alex.gorbachenko@gmail.com>
 Date: Sun, 31 May 2026 08:34:20 +0300
-Subject: [PATCH] Pass Vec<u8> by ownership through write_to chain
+Subject: [PATCH 1/2] Pass Vec<u8> by ownership through write_to chain
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
