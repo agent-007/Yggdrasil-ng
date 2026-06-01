@@ -22,7 +22,7 @@ use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey};
 use self::session::{ConcurrentSessionManager, OutAction, SESSION_TRAFFIC_OVERHEAD};
 
 /// Maximum number of decrypted packets buffered for read_from.
-const BUFFER_CAPACITY: usize = 64;
+const BUFFER_CAPACITY: usize = 512;
 
 /// A decrypted message waiting to be delivered.
 #[derive(Clone)]
@@ -62,12 +62,6 @@ impl TrafficBuffer {
         }
     }
 
-    /// Try to pop a message without waiting. Returns immediately.
-    async fn try_pop(&self) -> Option<QueuedMessage> {
-        let mut q = self.queue.lock().await;
-        q.pop_front()
-    }
-
     /// Wait for a message or cancellation.
     async fn pop_or_wait(&self, cancel: &CancellationToken) -> Option<QueuedMessage> {
         loop {
@@ -105,24 +99,18 @@ pub struct SessionEntry {
 /// with a `Notify` for wakeup.  This replaces the heavier `mpsc` channel used
 /// previously.
 ///
-/// `read_from` pops from this buffer.  If the buffer is empty, `read_from`
-/// reads and decrypts directly from the inner PacketConn, avoiding the
-/// intermediate wakeup entirely on the hot path.
+/// `read_from` pops from this buffer using `pop_or_wait`, blocking until a
+/// packet is available.  The background reader is the sole reader from
+/// `inner` — no lock contention.
 pub struct EncryptedPacketConn {
     /// The underlying network-level PacketConn.
     inner: Arc<PacketConnImpl>,
     /// Our Ed25519 signing key.
     signing_key: SigningKey,
-    /// Our Curve25519 private key (derived from Ed25519 seed).
-    curve_priv: CurvePrivateKey,
     /// Session manager with per-session locking.
     sessions: Arc<ConcurrentSessionManager>,
     /// Buffered decrypted traffic from background reader.
     buffer: Arc<TrafficBuffer>,
-    /// Serialises access to `inner.read_from()` between the background reader
-    /// and the inline read in `read_from`.  Both tasks may call inner.read_from()
-    /// concurrently, so a mutex ensures packets are not stolen mid-read.
-    inner_lock: Arc<Mutex<()>>,
     /// Whether this conn is closed.
     closed: AtomicBool,
     /// Cancellation for background tasks.
@@ -140,7 +128,6 @@ impl EncryptedPacketConn {
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
         let sessions = Arc::new(ConcurrentSessionManager::new());
         let buffer = TrafficBuffer::new();
-        let inner_lock = Arc::new(Mutex::new(()));
         let cancel = CancellationToken::new();
 
         // Spawn background reader for session management and traffic buffering
@@ -148,12 +135,11 @@ impl EncryptedPacketConn {
             let inner = inner.clone();
             let sessions = sessions.clone();
             let buffer = buffer.clone();
-            let inner_lock = inner_lock.clone();
             let cancel = cancel.clone();
             let signing_key = secret.clone();
             let curve_priv = curve_priv;
             tokio::spawn(session_handler_loop(
-                inner, sessions, buffer, inner_lock, cancel,
+                inner, sessions, buffer, cancel,
                 signing_key, curve_priv,
             ))
         };
@@ -168,10 +154,8 @@ impl EncryptedPacketConn {
         Self {
             inner,
             signing_key: secret,
-            curve_priv,
             sessions,
             buffer,
-            inner_lock,
             closed: AtomicBool::new(false),
             cancel,
             reader_handle: Mutex::new(Some(reader_handle)),
@@ -274,7 +258,6 @@ async fn session_handler_loop(
     inner: Arc<PacketConnImpl>,
     sessions: Arc<ConcurrentSessionManager>,
     buffer: Arc<TrafficBuffer>,
-    inner_lock: Arc<Mutex<()>>,
     cancel: CancellationToken,
     signing_key: SigningKey,
     curve_priv: CurvePrivateKey,
@@ -284,12 +267,9 @@ async fn session_handler_loop(
     let mut buf = vec![0u8; 128 * 1024];
 
     loop {
-        let read_result = {
-            let _guard = inner_lock.lock().await;
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = inner.read_from(&mut buf) => result,
-            }
+        let read_result = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = inner.read_from(&mut buf) => result,
         };
 
         let (n, from_addr) = match read_result {
@@ -321,57 +301,28 @@ async fn session_handler_loop(
 impl crate::types::PacketConn for EncryptedPacketConn {
     /// Read and decrypt a packet from the network.
     ///
-    /// Hot path: first tries the traffic buffer (pushed by the background
-    /// session handler).  If empty, reads directly from inner and decrypts
-    /// inline — this eliminates the task wakeup when the calling task is
-    /// the one waiting on `inner.read_from()`.
+    /// Always reads from the traffic buffer (populated by the background
+    /// session handler).  Blocks until a packet is available or the
+    /// connection is cancelled.  No inline read from `inner` — avoids
+    /// lock contention with the background reader.
     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
-        use crate::types::PacketConn;
-
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
 
-        // Fast path: check buffer first (cheap, no wakeup needed)
-        if let Some(msg) = self.buffer.try_pop().await {
-            let n = buf.len().min(msg.data.len());
-            buf[..n].copy_from_slice(&msg.data[..n]);
-            return Ok((n, Addr(msg.source)));
-        }
-
-        // Slow path: nothing buffered — read from inner directly.
-        // This avoids the context switch between background reader and us.
-        let cancel = self.cancel.clone();
-        let mut inner_buf = vec![0u8; 128 * 1024];
-
+        // Always read from buffer — background reader is sole reader of inner
         loop {
-            let read_result = {
-                let _guard = self.inner_lock.lock().await;
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(Error::Closed),
-                    result = self.inner.read_from(&mut inner_buf) => result,
+            match self.buffer.pop_or_wait(&self.cancel).await {
+                Some(msg) => {
+                    // Re-check for non-traffic packets that need session handling
+                    // (session init/ack messages are processed by background reader
+                    // and routed via SendToInner, not pushed to buffer —
+                    // so everything in the buffer is decrypted traffic)
+                    let n = buf.len().min(msg.data.len());
+                    buf[..n].copy_from_slice(&msg.data[..n]);
+                    return Ok((n, Addr(msg.source)));
                 }
-            };
-
-            let (n, from_addr) = read_result?;
-            let from_key = from_addr.0;
-
-            let actions = self.sessions.handle_data(
-                &from_key, &inner_buf[..n],
-                &self.curve_priv, &self.signing_key,
-            );
-
-            for action in actions {
-                match action {
-                    OutAction::SendToInner { dest, data } => {
-                        let _ = self.inner.write_to(data, &Addr(dest)).await;
-                    }
-                    OutAction::Deliver { source, data } => {
-                        let n = buf.len().min(data.len());
-                        buf[..n].copy_from_slice(&data[..n]);
-                        return Ok((n, Addr(source)));
-                    }
-                }
+                None => return Err(Error::Closed), // cancelled
             }
         }
     }
